@@ -29,6 +29,11 @@
 + 结论 LLM 的 ``refused`` 字段。
 
 并发限制：iFinD 检索用 ``asyncio.Semaphore(2)``；LLM 调用用独立信号量。
+
+追问链路：``build_result_context(result)`` 把上面这份结果压成带证据编号
+（``E1``、``E2``…，与前端证据卡编号一致）的上下文文本，交给
+``llm_client.ask_followup(context, question)`` 回答追问，
+回答里的 ``[E3]`` 因此能逐条回查到原始公告 / 新闻。
 """
 
 from __future__ import annotations
@@ -723,6 +728,12 @@ def _assemble(
     errors: list,
 ) -> dict:
     """统一组装返回结构（保证各条短路路径的字段完全一致）。"""
+    # 给每条证据分配稳定编号（E1、E2…）：前端展示与「追问」引用靠它对齐。
+    # 扁平列表与子问题下的 evidence 是同一批 dict 对象，这里编号一次即可。
+    for i, ev in enumerate(evidence, start=1):
+        if isinstance(ev, dict):
+            ev.setdefault("eid", f"E{i}")
+
     return {
         "thesis": thesis,
         "clarified_thesis": (parsed or {}).get("clarified_thesis") or "",
@@ -771,6 +782,126 @@ def _empty_result(
         },
         errors,
     )
+
+
+# ---------------------------------------------------------------------------
+# 追问上下文：把一次验证结果压成可追溯的文本（证据带 E1/E2 编号）
+# ---------------------------------------------------------------------------
+CONTEXT_SNIPPET_CHARS = 220  # 上下文中每条证据的片段截断长度
+MAX_CONTEXT_EVIDENCE = 30  # 上下文中最多列多少条证据（按 支持 > 反驳 > 无法验证 优先）
+
+_STATUS_CN = {"support": "支持", "oppose": "反驳", "unverifiable": "无法验证"}
+_STATUS_ORDER = {"support": 0, "oppose": 1, "unverifiable": 2}
+_VERDICT_CN = {v: k for k, v in VERDICT_ALIAS.items()}  # 英文 key -> 中文结论名
+
+
+def build_result_context(result: dict) -> str:
+    """把 ``verify_thesis`` 的结果转成「追问」用的上下文文本。
+
+    内容包含：命题 / 澄清后命题 / 主体 / 检索时间窗 / 子问题清单 /
+    带编号的证据卡（``E1``、``E2``…，编号与前端展示一致）/ 数字冲突 /
+    结论与变化条件 / 来源层状态。
+
+    追问回答里的 ``[E3]`` 正是引用这里的编号，因此结论可回溯到原始公告、新闻。
+    """
+    if not result:
+        return ""
+
+    lines: list = []
+
+    # ---- 命题与范围 ----
+    lines.append("【命题】")
+    lines.append(f"- 原始命题：{result.get('thesis') or '—'}")
+    if result.get("clarified_thesis"):
+        lines.append(f"- 澄清后命题：{result['clarified_thesis']}")
+    lines.append(f"- 主体：{result.get('subject') or '未识别'}")
+    window = result.get("time_window") or {}
+    lines.append(
+        f"- 检索时间窗：{window.get('time_start') or '—'} ~ {window.get('time_end') or '—'}"
+    )
+    if result.get("time_range"):
+        lines.append(f"- 命题涉及时间范围：{result['time_range']}")
+
+    # ---- 子问题 ----
+    sub_questions = result.get("sub_questions") or []
+    lines.append("")
+    lines.append(f"【子问题（{len(sub_questions)}）】")
+    for sq in sub_questions:
+        lines.append(
+            f"- [{sq.get('id')}] {sq.get('question')}"
+            f"（维度：{sq.get('dimension') or '未指定'}；"
+            f"期望证据：{sq.get('evidence_type') or '未指定'}）"
+        )
+
+    # ---- 证据卡（带编号）----
+    evidence = [ev for ev in (result.get("evidence") or []) if isinstance(ev, dict)]
+    ordered = sorted(
+        evidence, key=lambda ev: _STATUS_ORDER.get(ev.get("status"), 9)
+    )[:MAX_CONTEXT_EVIDENCE]
+    lines.append("")
+    lines.append(f"【证据（共 {len(evidence)} 条，下列 {len(ordered)} 条）】")
+    if not ordered:
+        lines.append("- 无")
+    for ev in ordered:
+        snippet = (ev.get("snippet") or "").strip().replace("\n", " ")
+        if len(snippet) > CONTEXT_SNIPPET_CHARS:
+            snippet = snippet[:CONTEXT_SNIPPET_CHARS] + "…"
+        claim_txt = ""
+        if ev.get("numeric_claims"):
+            claim_txt = "｜数字：" + "；".join(
+                f"{c.get('metric')}={c.get('value')}{c.get('unit') or ''}"
+                for c in ev["numeric_claims"]
+                if isinstance(c, dict)
+            )
+        lines.append(
+            f"- [{ev.get('eid') or 'E?'}] 判定：{_STATUS_CN.get(ev.get('status'), ev.get('status'))}"
+            f"｜子问题：{ev.get('sub_question_id')}"
+            f"｜来源：{ev.get('source_type')}｜日期：{ev.get('date') or '—'}"
+            f"｜标题：{ev.get('title') or '（无标题）'}"
+        )
+        if ev.get("reason"):
+            lines.append(f"  理由：{ev['reason']}{claim_txt}")
+        elif claim_txt:
+            lines.append(f"  数字：{claim_txt.lstrip('｜')}")
+        if snippet:
+            lines.append(f"  片段：{snippet}")
+
+    # ---- 冲突 ----
+    conflicts = result.get("conflicts") or []
+    lines.append("")
+    lines.append(f"【数字冲突（{len(conflicts)}）】")
+    if not conflicts:
+        lines.append("- 未检测到")
+    for c in conflicts:
+        values = "；".join(
+            f"{v.get('value')}{v.get('unit') or ''}（{v.get('source_type')} {v.get('date')}）"
+            for v in (c.get("values") or [])
+        )
+        lines.append(f"- {c.get('metric')}：{values}｜{c.get('note') or ''}")
+
+    # ---- 结论 ----
+    verdict = result.get("verdict") or {}
+    lines.append("")
+    lines.append("【当前结论】")
+    lines.append(
+        f"- 结论：{_VERDICT_CN.get(verdict.get('verdict'), verdict.get('verdict')) or '—'}"
+        f"（refused={bool(verdict.get('refused'))}）"
+    )
+    lines.append(f"- 说明：{verdict.get('summary') or '—'}")
+    for cond in verdict.get("change_conditions") or []:
+        lines.append(f"- 变化条件：{cond}")
+
+    # ---- 来源层状态 ----
+    retrieval = result.get("retrieval_summary") or {}
+    lines.append("")
+    lines.append(
+        f"【检索概况】ok={retrieval.get('ok', 0)} / missing={retrieval.get('missing', 0)}"
+        f" / failed={retrieval.get('failed', 0)}"
+    )
+    for msg in retrieval.get("messages") or []:
+        lines.append(f"- {msg}")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

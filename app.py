@@ -2,13 +2,18 @@
 
 输入投资命题 -> 点击「开始验证」 -> 调用 orchestrator.verify_thesis 走完整验证链路，
 然后以三栏布局呈现：子问题 / 证据 / 冲突与结论。
+
+结论与冲突卡之后提供「继续追问」：把 {命题、子问题、证据卡、结论} 作为上下文，
+连同用户的新问题交给 ``llm_client.ask_followup`` 回答，用聊天气泡展示，
+历史存在 ``st.session_state``，回答里的 [E1] 编号可回查到具体证据卡。
 """
 
 from datetime import date, timedelta
 
 import streamlit as st
 
-from orchestrator import verify_thesis
+from llm_client import ask_followup
+from orchestrator import build_result_context, verify_thesis
 
 st.set_page_config(
     page_title="投资命题验证台",
@@ -34,6 +39,17 @@ st.markdown(
         background: rgba(255, 255, 255, .96);
         border-top: 1px solid #e5e7eb;
         backdrop-filter: blur(6px);
+      }
+      /* 验证结果存在时改用内联声明（见页面末尾），跟随内容滚动，
+         不与 st.chat_input 的固定浮动容器（高约 90~130px，随版本不同）重叠 */
+      .compliance-inline {
+        margin-top: 1.25rem;
+        padding: 10px 16px;
+        text-align: center;
+        font-size: 12px;
+        letter-spacing: .3px;
+        color: #6b7280;
+        border-top: 1px solid #e5e7eb;
       }
       /* 给固定底栏留出空间，避免遮挡内容 */
       .block-container { padding-bottom: 4rem; }
@@ -82,11 +98,19 @@ def sub_question_status(item: dict) -> tuple:
 
 
 def render_evidence_card(ev: dict) -> None:
-    """单条证据卡：来源 / 标题 / 日期 / 理由 / 片段 / 数字。"""
+    """单条证据卡：编号 / 来源 / 标题 / 日期 / 理由 / 片段 / 数字。
+
+    开头展示的 `E3` 编号与「继续追问」回答里的 [E3] 引用一一对应。
+    """
     status = ev.get("status", "unverifiable")
     color = STATUS_COLOR.get(status, "gray")
     with st.container(border=True):
-        st.markdown(f":{color}[**{STATUS_LABEL.get(status, status)}**] · {ev.get('source_type', '')}")
+        eid = ev.get("eid") or ""
+        badge = f"`{eid}` · " if eid else ""
+        st.markdown(
+            f":{color}[**{STATUS_LABEL.get(status, status)}**] · {badge}"
+            f"{ev.get('source_type', '')}"
+        )
         st.markdown(f"**{(ev.get('title') or '（无标题）')[:60]}**")
         if ev.get("date"):
             st.caption(f"日期：{ev['date']}")
@@ -120,6 +144,12 @@ with col_start:
 with col_end:
     time_end = st.date_input("结束日期", value=date.today())
 
+# ---------------------------------------------------------------------------
+# 追问相关的会话状态：历史与上下文，跨 rerun 保留
+# ---------------------------------------------------------------------------
+st.session_state.setdefault("followups", [])  # [{"role": "user"/"assistant", "text", "citations", "refused", "insufficient"}]
+st.session_state.setdefault("followup_context", "")  # 本次验证结果压成的追问上下文
+
 if st.button("开始验证", type="primary"):
     query = thesis.strip()
     if not query:
@@ -130,6 +160,11 @@ if st.button("开始验证", type="primary"):
                 query, time_start=str(time_start), time_end=str(time_end)
             )
             st.session_state["result_thesis"] = query
+        # 换了一条命题：追问历史与上下文都作废，避免串台
+        st.session_state["followups"] = []
+        st.session_state["followup_context"] = build_result_context(
+            st.session_state["result"]
+        )
 
 result = st.session_state.get("result")
 
@@ -224,10 +259,124 @@ if result:
                 for cond in conditions:
                     st.markdown(f"- {cond}")
 
+    # ---------------- 结论卡 / 冲突卡之后：继续追问 ----------------
+    st.divider()
+    st.subheader("继续追问")
+    st.caption(
+        "基于本次验证的命题、子问题、证据卡与结论作答，回答中的 `E1` 编号可回查到上方证据卡；"
+        "仅做事实梳理，不提供涨跌预测或买卖建议。"
+    )
+
+    # 证据编号 -> 证据对象，用于把 [E3] 这类引用还原成具体来源
+    ev_by_id = {
+        ev.get("eid"): ev
+        for ev in (result.get("evidence") or [])
+        if isinstance(ev, dict) and ev.get("eid")
+    }
+
+    # 追问上下文按需构建并缓存（避免每次 rerun 重算）
+    if not st.session_state.get("followup_context"):
+        st.session_state["followup_context"] = build_result_context(result)
+
+    def render_assistant(msg: dict) -> None:
+        """助手气泡：回答正文 + 引用证据编号 + 引用原文。"""
+        if msg.get("refused"):
+            st.markdown(f":orange[{msg['text']}]")
+            st.caption("合规提示：涉及涨跌预测或操作建议的提问，一律只做事实梳理。")
+            return
+
+        st.markdown(msg["text"])
+
+        citations = [c for c in (msg.get("citations") or []) if c in ev_by_id]
+        if citations:
+            st.caption("引用证据：" + "　".join(f"`{c}`" for c in citations))
+            with st.expander(f"查看引用的 {len(citations)} 条证据原文"):
+                for cid in citations:
+                    ev = ev_by_id[cid]
+                    st.markdown(
+                        f"**`{cid}`** ｜ {STATUS_LABEL.get(ev.get('status'), '')} ｜ "
+                        f"{ev.get('source_type')} ｜ {ev.get('date') or '—'}"
+                    )
+                    st.markdown(f"{ev.get('title') or '（无标题）'}")
+                    snippet = (ev.get("snippet") or "").strip()
+                    if snippet:
+                        st.caption(snippet[:300] + ("…" if len(snippet) > 300 else ""))
+                    if ev.get("url"):
+                        st.markdown(f"[查看原文]({ev['url']})")
+                    st.divider()
+
+        if msg.get("insufficient"):
+            st.caption("提示：该问题未被本次检索到的证据覆盖，回答已按「事实梳理」范围收口。")
+
+    # 历史追问（来自 st.session_state，刷新/重跑不丢）
+    for msg in st.session_state["followups"]:
+        with st.chat_message(msg.get("role", "assistant")):
+            if msg.get("role") == "user":
+                st.markdown(msg.get("text", ""))
+            else:
+                render_assistant(msg)
+
+    # 追问输入框（固定在页面底部）
+    prompt = st.chat_input("针对结论继续追问…")
+    if prompt:
+        question = prompt.strip()
+        history = list(st.session_state["followups"])
+
+        st.session_state["followups"].append({"role": "user", "text": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        with st.chat_message("assistant"):
+            with st.spinner("正在基于本次证据回答…"):
+                try:
+                    answer = ask_followup(
+                        st.session_state["followup_context"], question, history=history
+                    )
+                except Exception as exc:  # noqa: BLE001 - 页面不能因为追问挂掉
+                    answer = {
+                        "refused": False,
+                        "answer": f"回答失败：{type(exc).__name__}: {exc}",
+                        "citations": [],
+                        "insufficient": True,
+                    }
+            render_assistant(
+                {
+                    "role": "assistant",
+                    "text": answer.get("answer", ""),
+                    "citations": answer.get("citations") or [],
+                    "refused": bool(answer.get("refused")),
+                    "insufficient": bool(answer.get("insufficient")),
+                }
+            )
+
+        st.session_state["followups"].append(
+            {
+                "role": "assistant",
+                "text": answer.get("answer", ""),
+                "citations": answer.get("citations") or [],
+                "refused": bool(answer.get("refused")),
+                "insufficient": bool(answer.get("insufficient")),
+            }
+        )
+
+    if st.session_state["followups"]:
+        if st.button("清空追问记录"):
+            st.session_state["followups"] = []
+            st.rerun()
+
+    # 追问输入框是固定在视口底部的浮动容器（不同 Streamlit 版本高度不同），
+    # 给页面底部留出足够空间，保证滚动到最底时内联合规声明不会被输入框盖住
+    st.markdown(
+        "<style>.block-container { padding-bottom: 11rem; }</style>",
+        unsafe_allow_html=True,
+    )
+
 # ---------------------------------------------------------------------------
-# 底部固定合规声明（始终显示）
+# 合规声明：未验证时固定在视口底部；验证后内联在页面末尾（追问输入框上方），
+# 避免固定横条压住 st.chat_input 的浮动容器
 # ---------------------------------------------------------------------------
-st.markdown(
-    '<div class="compliance-footer">本产品仅用于投资研究辅助，不构成投资建议。</div>',
-    unsafe_allow_html=True,
-)
+COMPLIANCE_TEXT = "本产品仅用于投资研究辅助，不构成投资建议。"
+if result:
+    st.markdown(f'<div class="compliance-inline">{COMPLIANCE_TEXT}</div>', unsafe_allow_html=True)
+else:
+    st.markdown(f'<div class="compliance-footer">{COMPLIANCE_TEXT}</div>', unsafe_allow_html=True)

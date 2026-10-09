@@ -100,8 +100,67 @@ __COMPLIANCE__
 {"refused": false, "verdict": "partial_support", "summary": "一句话事实性结论（不超过60字，不含操作建议）",
  "change_conditions": ["若<可观测事实>，则结论转弱", "若<可观测事实>，则结论转强"]}
 
-【预测/操作类命题】
+ 【预测/操作类命题】
 {"refused": true, "verdict": "insufficient", "summary": "仅做事实梳理", "change_conditions": []}"""
+
+# ---------------------------------------------------------------------------
+# 「继续追问」问答提示词（ask_followup）
+#
+# 与结论生成的区别：结论是「对命题的判定」，追问是「对已检索事实的问答」。
+# 硬约束：只能使用上下文里出现的事实，必须标注证据编号，上下文没覆盖就说没覆盖。
+# ---------------------------------------------------------------------------
+FOLLOWUP_SYSTEM = (
+    "你是一个严谨的投研研究助理，只输出合法 JSON，不要输出任何解释文字。"
+    "你只依据给定的验证上下文回答事实性问题，不提供任何投资建议，不做涨跌预测。"
+)
+
+FOLLOWUP_PROMPT = """用户正在针对一次「投资命题验证」的结果继续追问，请基于给定上下文回答。
+
+━━━ 第一步：合规判断（优先执行）━━━
+若用户的问题本身要求**预测涨跌、买卖时机、目标价或仓位操作**，
+禁止给出任何预测或建议：直接拒绝并**立即结束**，只输出下面这个 JSON：
+{"refused": true, "answer": "仅做事实梳理", "citations": [], "insufficient": false}
+
+若不涉及，才继续第二步。
+
+━━━ 第二步：基于上下文回答 ━━━
+回答规则（必须逐条遵守）：
+1. 只能使用下面「本次验证上下文」里出现过的事实、数字与来源；
+   上下文没覆盖的内容，必须明确写「现有证据未覆盖」，不得用外部知识补充，不得推测。
+2. 每条事实性陈述后必须标注证据编号（形如 [E3]），编号取自上下文中的证据条目；
+   citations 字段列出本次回答用到的全部编号。
+3. 禁止出现「涨 / 跌 / 买入 / 卖出 / 推荐 / 目标价 / 加仓」等价格方向或操作用语，
+   不得承诺或暗示收益，不得给出任何操作建议。
+4. answer 用分点陈述，不超过 200 字；只做事实梳理，不评价标的好坏。
+5. 若上下文中的证据互相矛盾，必须同时列出冲突双方的数字与来源，不得只取一方。
+
+【本次验证上下文】
+__CONTEXT__
+
+【历史追问】
+__HISTORY__
+
+【用户本次追问】
+__QUESTION__
+
+__COMPLIANCE__
+
+只输出 JSON（两种形态二选一，不要输出其他内容）：
+
+【普通回答】
+{"refused": false, "answer": "分点事实性回答，含 [E1] 这类编号", "citations": ["E1"], "insufficient": false}
+
+【问题涉及预测/操作】
+{"refused": true, "answer": "仅做事实梳理", "citations": [], "insufficient": false}"""
+
+# 追问被合规拒绝时的固定回复（比结论更具体一点，顺带给用户可替代的问法）
+REFUSAL_FOLLOWUP_ANSWER = (
+    "仅做事实梳理：本产品不对涨跌、买卖时机、目标价或仓位操作做任何预测或建议。"
+    "可以改问与公告/新闻事实相关的问题，例如某项指标的口径、来源或变化原因。"
+)
+
+# 追问回答生成失败时的降级文案（不编内容）
+FOLLOWUP_FAILED_ANSWER = "未能生成回答（模型调用失败或返回格式异常），请稍后重试。"
 
 # 明确指向「股价方向」或「交易动作」的说法。
 # 刻意不收裸的「涨 / 跌」二字：否则「产品涨价」「营收增长」这类事实性表述会被误判。
@@ -159,6 +218,20 @@ def build_conclusion_prompt(thesis: str, clarified: str, digest: str, conflicts:
         .replace("__CLARIFIED__", clarified or thesis or "")
         .replace("__DIGEST__", digest or "")
         .replace("__CONFLICTS__", conflicts or "无")
+        .replace("__COMPLIANCE__", COMPLIANCE_RULES)
+    )
+
+
+def build_followup_prompt(context: str, question: str, history: str = None) -> str:
+    """渲染「追问」提示词。
+
+    同样统一注入合规红线（``COMPLIANCE_RULES``），并用 ``str.replace`` 填充占位符
+    （模板含 JSON 大括号，不能用 ``str.format``）。
+    """
+    return (
+        FOLLOWUP_PROMPT.replace("__CONTEXT__", (context or "").strip() or "（无上下文）")
+        .replace("__HISTORY__", (history or "").strip() or "（无）")
+        .replace("__QUESTION__", (question or "").strip())
         .replace("__COMPLIANCE__", COMPLIANCE_RULES)
     )
 
@@ -304,6 +377,183 @@ def parse_thesis(thesis: str) -> dict:
         f"拆解出 {len(subs) if isinstance(subs, list) else 0} 个子问题"
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# 追问回答的解析与合规兜底
+# ---------------------------------------------------------------------------
+_EID_RE = re.compile(r"E(\d{1,3})", re.I)
+
+# 模型偶尔会绕开 COMPLIANCE_RULES 输出操作用语，这里在代码层再兜一层
+_ADVICE_EXTRA_PATTERNS = [
+    "建议持有", "建议增持", "建议减持", "建议配置", "建议关注", "建议买入", "建议卖出",
+    "可以买入", "可以卖出", "值得配置", "加仓", "减仓", "建仓", "仓位建议",
+]
+
+
+def _truthy(value) -> bool:
+    """把模型返回的各种「真值」写法统一成 bool（有时回字符串 "true"）。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "是"}
+    return bool(value)
+
+
+def _collect_citations(answer: str, raw_citations) -> list:
+    """汇总引用编号：模型给的 citations 字段 + 正文里出现的 [E3] 这类编号，去重保序。"""
+    found: list = []
+
+    def _add(token):
+        m = _EID_RE.fullmatch(str(token).strip().strip("[]【】（）()"))
+        if m and m.group(0).upper() not in found:
+            found.append(m.group(0).upper())
+
+    if isinstance(raw_citations, (list, tuple)):
+        for item in raw_citations:
+            _add(item)
+    elif isinstance(raw_citations, str):
+        for token in re.split(r"[,，、;；\s]+", raw_citations):
+            _add(token)
+
+    for token in _EID_RE.findall(answer or ""):
+        _add(f"E{token}")
+
+    return found[:10]
+
+
+def _contains_advice(text: str) -> list:
+    """回答文本里出现的价格方向 / 操作用语（合规兜底检测）。"""
+    hits = detect_prediction_intent(text or "")
+    hits += [kw for kw in _ADVICE_EXTRA_PATTERNS if kw in (text or "")]
+    return list(dict.fromkeys(hits))
+
+
+HISTORY_TURNS = 6  # 追问上下文里最多回放几轮历史
+
+
+def _format_history(history: list) -> str:
+    """把追问历史压成文本（只取最近若干轮）。"""
+    if not history:
+        return ""
+    lines = []
+    for msg in history[-HISTORY_TURNS:]:
+        if not isinstance(msg, dict):
+            continue
+        role = "用户" if msg.get("role") == "user" else "助手"
+        text = str(msg.get("text") or "").strip()
+        if text:
+            lines.append(f"{role}：{text}")
+    return "\n".join(lines)
+
+
+def _refused_answer(hits: list = None) -> dict:
+    return {
+        "refused": True,
+        "answer": REFUSAL_FOLLOWUP_ANSWER,
+        "citations": [],
+        "insufficient": False,
+        "hits": hits or [],
+    }
+
+
+def ask_followup(
+    context: str,
+    question: str,
+    history: list = None,
+    tag: str = "[llm:ask_followup]",
+    max_attempts: int = MAX_ATTEMPTS,
+) -> dict:
+    """基于一次验证结果回答用户的追问。
+
+    参数
+    ----
+    context : str
+        验证上下文文本，由 ``orchestrator.build_result_context(result)`` 生成，
+        内含命题、子问题、带编号（E1、E2…）的证据卡、冲突与结论。
+    question : str
+        用户的新问题。
+    history : list, 可选
+        追问历史，元素形如 ``{"role": "user"/"assistant", "text": "..."}``；
+        只取最近 ``HISTORY_TURNS`` 轮送进模型，避免上下文无限膨胀。
+
+    返回
+    ----
+    dict
+        ``{"refused": bool, "answer": str, "citations": [str], "insufficient": bool,
+        "hits": [str]}``
+
+        - ``refused=true``：问题涉及预测涨跌 / 买卖时机 / 目标价 / 仓位操作，
+          已合规拒绝，answer 固定为 ``REFUSAL_FOLLOWUP_ANSWER``，不调用模型；
+        - ``insufficient=true``：模型调用失败或返回格式异常，answer 为降级文案；
+        - ``citations``：回答引用的证据编号，供前端定位到具体证据卡。
+
+    合规兜底有三层：① 问题级确定性拦截（``detect_prediction_intent``）；
+    ② 提示词内的拒绝分支（``refused`` 字段）；③ 回答文本的用语再检测。
+    """
+    if not question or not question.strip():
+        return {
+            "refused": False,
+            "answer": "请先输入一个与本次验证相关的问题。",
+            "citations": [],
+            "insufficient": True,
+            "hits": [],
+        }
+
+    # 第一层：问题级确定性闸门
+    hits = detect_prediction_intent(question)
+    if hits:
+        print(f"{tag} 合规拒绝：问题涉及预测涨跌/操作建议，命中 {hits}")
+        return _refused_answer(hits)
+
+    prompt = build_followup_prompt(context, question, history=_format_history(history))
+    raw = chat_json(prompt, system=FOLLOWUP_SYSTEM, tag=tag, max_attempts=max_attempts)
+
+    if not raw:
+        print(f"{tag} 未取到合法 JSON，返回降级文案")
+        return {
+            "refused": False,
+            "answer": FOLLOWUP_FAILED_ANSWER,
+            "citations": [],
+            "insufficient": True,
+            "hits": [],
+        }
+
+    answer = str(raw.get("answer") or "").strip()
+
+    # 第二层：模型自报 refused；第三层：回答用语再检测
+    if _truthy(raw.get("refused")):
+        print(f"{tag} 模型判定为预测/操作类问题，已拒绝")
+        return _refused_answer()
+
+    advice = _contains_advice(answer)
+    if advice:
+        print(f"{tag} 回答命中操作用语 {advice}，整体降级为合规拒绝")
+        return _refused_answer(advice)
+
+    if not answer:
+        return {
+            "refused": False,
+            "answer": FOLLOWUP_FAILED_ANSWER,
+            "citations": [],
+            "insufficient": True,
+            "hits": [],
+        }
+
+    citations = _collect_citations(answer, raw.get("citations"))
+    # 「证据未覆盖」以正文里的明确措辞为准（提示词强制要求这么写）；
+    # 模型自报的 insufficient 只在「没有任何引用」时才采信，避免它过度置真。
+    insufficient = ("未覆盖" in answer) or (
+        _truthy(raw.get("insufficient")) and not citations
+    )
+    print(f"{tag} 成功：引用 {citations or '无'}，未覆盖={insufficient}")
+    return {
+        "refused": False,
+        "answer": answer,
+        "citations": citations,
+        "insufficient": insufficient,
+        "hits": [],
+    }
 
 
 if __name__ == "__main__":
