@@ -1,45 +1,256 @@
 # 投资命题验证台（thesisproof）
 
-一个基于 Streamlit 的演示应用：输入一条投资命题，点击「开始验证」，页面会展示该命题的验证骨架——拆解出的子问题、每个子问题的支撑/反驳证据，以及最终结论。
+## 1. 产品定位
 
-> 当前所有验证数据均为**占位假数据**，仅用于演示页面交互与信息结构。
+**一句话**：输入一条投资命题，自动拆解为可验证子问题 → 检索公告与新闻证据 → 按支持/反对/无法验证分类 → 检测同一指标的数字冲突 → 输出一条**事实性**验证结论（只做事实梳理，不构成投资建议）。
 
-## 目录结构
+面向的使用场景是投研初筛：把「我觉得……所以……会上涨」这类模糊判断，压成一组**可被证据检验**的子问题，并对证据本身给出可追溯的判定，而不是直接给方向。
+
+---
+
+## 2. 快速启动
+
+### 2.1 本地运行
+
+```bash
+# 1. 进入项目目录
+cd thesisproof
+
+# 2. 安装依赖
+pip install -r requirements.txt
+
+# 3. 配置密钥（二选一，见第 3 节）：
+#    本地 .env                     —— 直接新建 .env 并填入
+#    或 Streamlit Secrets          —— 复制 .streamlit/secrets.toml.example → .streamlit/secrets.toml
+
+# 4. 启动
+streamlit run app.py
+```
+
+浏览器会自动打开 `http://localhost:8501`。
+
+**运行前置条件**
+
+- Python 3.10+（代码使用了 `X | None` 类型标注）
+- 可访问 DeepSeek API（`api.deepseek.com`）
+- 可访问 iFinD MCP（`api-mcp.51ifind.com:8643`）并提供认证 token（见第 3 节）
+
+iFinD 调用走项目**内置**的 `ifind_call.py`（官方远程 MCP，HTTP + JSON-RPC），**不依赖本机 skill 目录**，因此本地与线上是同一份实现。只有在缺少内置模块时，才会回退到本机安装的 skill（`~/.workbuddy/skills/ifind-finance-data`），该回退路径仅在本地可用。
+
+**单次验证耗时**：约 **20–45 秒**。以拆出 6 个子问题为例，耗时大头是 iFinD 检索（6 子问题 × 2 来源）+ **8 次 LLM 调用**（1 次命题拆解 + 6 次逐子问题证据分类 + 1 次结论生成；不含重试）。期间有 spinner，不会白屏。
+
+### 2.2 线上部署
+
+**当前状态：已上线**（Streamlit Community Cloud）
+
+```
+https://thesisproof-bxvn3ykgmlvafzyeenu2zz.streamlit.app/
+```
+
+**部署方式**：仓库推到 GitHub → 在 share.streamlit.io 选中 `app.py`。
+
+**线上必须先配 Secrets。** 代码在线上**读不到** `.env`（已被 `.gitignore` 排除、不会上传仓库），所以密钥要配在平台侧：
+
+> App settings → Secrets → 粘贴下面内容（换成真实值）
+
+```toml
+DEEPSEEK_API_KEY = "sk-xxxxxxxx"
+IFIND_MCP_KEY = "eyJxxxxxxxx"
+```
+
+模板见仓库里的 `.streamlit/secrets.toml.example`。**键名必须完全一致** —— Streamlit 会把顶层 secret 写入环境变量，项目通过 `config.get_secret()` 统一读取；键名对不上会表现为「检索不到证据」或「未找到 API Key」。
+
+本地若想用同一套 Secrets 机制，把模板复制为 `.streamlit/secrets.toml` 即可（同样已被忽略）。
+
+**为什么现在线上能跑通**：早期版本用 `sys.path.append` 指向本机 skill 目录，云端没有那个目录，检索层会**静默降级为空结果** —— 页面能打开、命题也能拆解、结论也能生成，但**证据栏全是空的**，且不报错。现在调用逻辑已内置为 `ifind_call.py`，token 从环境变量 / Secrets 读取，本地与线上共用同一份实现。
+
+---
+
+## 3. 环境变量清单
+
+配置由 `config.get_secret()` 统一读取，优先级：
+
+1. **真实环境变量**（含 Streamlit Cloud 上配置的顶层 Secrets —— Streamlit 会把顶层 secret 写入 `os.environ`）
+2. **`.env`**（本地开发用，由 `python-dotenv` 按文件位置加载，不依赖当前工作目录；已被 `.gitignore` 忽略）
+3. **`st.secrets`**（显式兜底，不依赖上面那条隐式提升的加载时序）
+
+| 变量名 | 必填 | 用途 | 当前状态 |
+|---|---|---|---|
+| `DEEPSEEK_API_KEY` | ✅ | DeepSeek Chat API 密钥，用于命题拆解、证据分类、结论生成 | **已接入** |
+| `IFIND_MCP_KEY` | ✅ | iFinD MCP 认证 token（与 `mcp_config.json` 的 `auth_token` 同值） | **已接入**，由 `ifind_call.get_auth_token()` 读取 |
+| `FUYAO_API_KEY` | — | 扶摇数据源密钥 | **仅占位，尚未接入**（代码中无任何引用） |
+
+本地 `.env` 示例：
+
+```dotenv
+DEEPSEEK_API_KEY=sk-xxxxxxxx
+FUYAO_API_KEY=xxxxxxxx
+IFIND_MCP_KEY=eyJxxxxxxxx
+```
+
+线上 Secrets 模板见 `.streamlit/secrets.toml.example`（本地可复制为 `.streamlit/secrets.toml` 使用）。
+
+**缺失时的行为**
+
+- `DEEPSEEK_API_KEY` 缺失：调用 LLM 时抛 `ValueError("未找到 DEEPSEEK_API_KEY，请检查 .env 文件（本地）或 Streamlit Secrets（线上）")`。
+- `IFIND_MCP_KEY` 缺失：`ifind_call.get_auth_token()` 抛 `RuntimeError` 并给出查找位置；上层 `search_notice` / `search_news` 会捕获它、打印错误并返回 `[]`，**不会让页面崩溃**（表现为检索层标记 `failed`）。
+- `FUYAO_API_KEY` 缺失不影响现有链路。
+
+---
+
+## 4. 产品选择说明
+
+### 4.1 为什么做这个产品
+
+通用大模型回答投资问题时，最常见的失败模式是「结论先行、证据含糊」。本产品反过来做：先把命题**拆成可验证的子问题**，再让每一个子问题都必须落到**可检索的公开文本证据**上，且每条证据都要给出「支持 / 反对 / 无法验证」的判定与理由。所有中间产物（子问题、证据、冲突）都直接展示给用户，便于人工复核。
+
+### 4.2 关键选型
+
+| 选择 | 理由 |
+|---|---|
+| **Streamlit** | 单文件即可承载「输入 → 长耗时任务 → 多栏结构化结果」的交互，无需前端工程；适合投研内部工具形态 |
+| **DeepSeek（`deepseek-chat`）** | 中文财经文本理解与 JSON 结构化输出稳定；`response_format=json_object` 可降低解析失败率；成本低 |
+| **iFinD 自然语言检索** | 公告 + 新闻两个源都能用自然语言查询，免去自建语料与索引 |
+| **`asyncio.Semaphore(2)` 限流** | 需求指定的 iFinD 并发上限；实测并发 2 仍会触发 429，因此叠加了退避重试 |
+| **数字冲突用确定性代码判定** | 不让 LLM 判断「两个数字是否矛盾」——阈值、单位换算必须可复现、可审计，交给人读代码就能验证 |
+| **冲突容差 `1e-4`（0.01%）** | 既能吸收四舍五入误差（`1708.99` vs `1709.0`），又能抓住 `1741.44` vs `1738` 这类 0.2% 的真实差异 |
+
+### 4.3 适用与不适用
+
+- **适用**：事实性命题，如「某公司 2024 年盈利改善来自主营业务」「某政策对某行业毛利率的影响」。
+- **不适用（会被合规拒绝）**：要求预测涨跌、买卖时机、目标价、仓位操作的命题，例如「该股票下周会涨吗」「现在该买入吗」。这类命题在检索前就被拦下，直接返回「仅做事实梳理」。
+
+---
+
+## 5. AI 的角色
+
+LLM（DeepSeek）在链路中承担 **3 个明确职责**，且都不涉及投资建议：
+
+| 环节 | 函数 | 输入 → 输出 |
+|---|---|---|
+| ① 命题拆解 | `llm_client.parse_thesis` | 命题 → 澄清后命题、主体、时间范围、3–6 个可验证子问题（含维度、期望证据类型） |
+| ② 证据分类 | `orchestrator._classify_one` | 子问题 + 证据片段 → 每条证据的 `support` / `oppose` / `unverifiable` 判定，并抽取其中的数字指标（`numeric_claims`） |
+| ③ 结论生成 | `llm_client.build_conclusion_prompt` + `orchestrator._generate_verdict` | 子问题判定摘要 + 冲突列表 → `{refused, verdict, summary, change_conditions}` |
+
+**边界与约束**
+
+- **AI 不做的事**：判断两个数字是否冲突（由 `detect_conflicts` 的确定性代码完成）；给方向性判断或操作建议（提示词 + 代码双层禁止）。
+- **容错**：每个 LLM 环节 JSON 解析失败都会**重试 1 次**（追加更强约束），仍失败则走兜底（返回 `{}` 或「结论生成失败」），不会让整个验证崩掉。
+- **合规**：结论 prompt 的**第一步**就是合规判断，红线集中在 `llm_client.COMPLIANCE_RULES`，由 `build_conclusion_prompt()` 强制注入，调用方漏不掉。
+- **双重闸门**（预测类命题）：① `llm_client.detect_prediction_intent()` 关键词+正则的**确定性前置拦截**（命中即拒绝，连检索都不执行）；② 结论 LLM 需要在 JSON 里返回 `refused` 字段，解析层再做一次兜底识别。
+
+> 补充说明：实测发现**仅靠提示词不可靠** —— 模型会把 summary 写成「仅做事实梳理：……」却依然给出 `partial_support` 和方向性判断，所以才补了代码层的确定性闸门。
+
+---
+
+## 6. 数据来源
+
+### 6.1 iFinD（当前唯一在用）
+
+调用实现在 `ifind_call.py`（内置的官方 MCP 客户端：`https://api-mcp.51ifind.com:8643/ds-mcp-servers`），对外封装在 `ifind_client.py`，两个函数：
+
+| 函数 | 用途 | 返回字段（中文键） |
+|---|---|---|
+| `search_notice(query, time_start, time_end, size=5)` | 检索上市公司**公告** | `公告标题` / `公告片段内容` / `日期` |
+| `search_news(query, time_start, time_end, size=5)` | 检索财经**新闻** | `资讯标题` / `资讯内容` / `日期` / `URL` |
+
+**关于检索性质的三个要点**：
+
+1. **语义检索，返回的是相关片段，不是公告全文** —— 同一份年报可能命中多个片段，这是正常现象。
+2. **返回结构是三层嵌套，且两个接口形状不同**（`search_news` 的列表在 `data.data`，`search_notice` 在 `data`），解析逻辑已做兼容分支处理。
+3. 接口会在末尾附带一条只含 `备注` 的说明条目，已被 `_is_meta_note()` 过滤，不会混进证据列表。
+
+字段归一化由 `orchestrator._normalize_item()` 完成（中文键 → `title` / `date` / `snippet` / `url`）。
+
+**token 从哪来**：`IFIND_MCP_KEY`（环境变量 / `.env` / Streamlit Secrets）。若都没配，会退回到本地 `mcp_config.json`（项目根目录，或 `~/.workbuddy/skills/ifind-finance-data/`）的 `auth_token` 字段。
+
+### 6.2 扶摇（Fuyao）
+
+- **当前状态：未接入**。`FUYAO_API_KEY` 只是 `.env` 里的占位项，代码中**没有任何引用**。
+- **规划定位**：作为 iFinD 之外的第二个数据来源补充，用于交叉验证同一指标的数字（这会直接增强第 7 节提到的「冲突检测」能力）。
+- **接入位置**：在 `orchestrator._fetch_source()` 中新增一个来源分支，并产出对应的 `sources` 状态卡即可，上层结构无需改动。
+
+---
+
+## 7. 已知边界
+
+**① 证据是「片段」而非全文**
+
+iFinD 是语义检索，返回的是与查询相关的文本片段（送进 LLM 前截断到约 350 字）。因此：
+
+- 同一份公告/年报可能命中多条片段，**目前未做去重**（如需「一份公告只留一条」，应在应用层按 `标题 + 日期` 或 `URL` 去重）；
+- 片段可能缺少上下文，个别数字的含义需要回到原文核对（证据卡里带原文链接）。
+
+**② 并发受限，仍会触发限流**
+
+- iFinD 检索固定 `Semaphore(2)`（需求指定）。
+- 实测**并发 2 依然会撞 429**（限流来自 iFinD 账号层级，提示语为「请求过于频繁」）。目前靠**退避重试**兜底：单个来源首次失败后等待 5 秒重试 1 次，仍失败则该来源标记为 `failed`（不会再静默变成「无结果」）。
+- 子问题数量继续增加时，可能需要进一步降低并发或调整重试等待。
+- **线上与本地共用同一个 iFinD 账号的限流池**：连续多次验证（或本地调试与线上同时使用）会互相挤占额度。实测一次完整验证（12 个来源）在额度紧张时可能出现 **2–6 个来源 `failed`**，表现是页面上对应栏位为空。额度充足时 12 张卡通常全部 `ok`。想让重试更耐受，可把 `orchestrator.SOURCE_ATTEMPTS` 从 `2` 调到 `3`（会变慢）。
+
+**③ 冲突检测依赖「数字是否被成功提取」**
+
+- 只有被 LLM 抽成 `numeric_claims` 的数值才参与冲突比对；**片段里存在但未被抽出的数字，检测不到**（存在漏报）。
+- 指标名归一化（`_norm_metric`）是字符串级处理，同义但不同表述的指标可能被分到不同桶（同样导致漏报）。
+- 已知**误报**场景：同一指标的「**业绩预告值 vs 实际值**」会被判为冲突（例如 2025-01-03 公告的预告 15.38% 对上 2025-04-03 年报的实际 14.67%）。逻辑上符合「同一指标多个不同数字」的定义，业务上却不是矛盾 —— 后续需要在指标命名或规则里区分预告/实际。
+- 金额单位（元 / 万元 / 亿元）已归一到统一量纲，不会因单位不同产生假冲突。
+
+**④ 其他**
+
+- 分类结果里 `oppose` 长期为 0，分类提示词对「反驳」的门槛可能偏严，待调优。
+- 结论由 LLM 生成，属于**事实梳理**性质，不构成投资建议。
+
+---
+
+## 8. 未做事项
+
+| # | 事项 | 说明 |
+|---|---|---|
+| 1 | **扶摇数据源接入** | 目前仅有占位密钥，无代码实现；接入后可支持跨源数字交叉验证 |
+| 2 | **结果导出** | 无报告导出（PDF / Word / 分享链接）能力 |
+| 3 | **历史记录与缓存** | 无验证历史留存，同一命题重复验证会重新全量检索、重新调 LLM |
+| 4 | **证据去重** | 同一公告的多条片段未合并 |
+| 5 | **预告 / 实际值区分** | 冲突检测暂不区分数据类型，会产生第 7 节所述的误报 |
+| 6 | **`sources` / `retrieval_summary` 的 UI 呈现** | 数据结构已产出（每个子问题 × 每个来源的状态卡 `ok`/`missing`/`failed`），但页面上尚未展示，失败来源目前只体现为「该栏为空」 |
+| 7 | **合规拒绝的 UI 提示** | `verdict.refused=true` 目前只表现为「证据不足 + 仅做事实梳理」，没有专门的醒目提示条 |
+| 8 | **自动化复检** | 无定时重跑机制（如「按周复检已保存的命题」） |
+| 9 | **用户体系 / 多租户** | 无登录、无权限、无配额管理 |
+| 10 | **正式测试** | 只有冒烟脚本（`test_ifind.py` / `test_llm.py`）与一次性桩测，无单元测试与 CI |
+| 11 | **`oppose` 判定调优** | 分类提示词对反驳证据的识别偏保守 |
+| 12 | **密钥轮换** | 线上密钥在 Streamlit Secrets 手工维护，无轮换与到期提醒机制 |
+
+---
+
+## 附：目录结构
 
 ```
 thesisproof/
-├── app.py            # Streamlit 主应用
-├── requirements.txt  # 依赖清单
-└── README.md         # 说明文档
+├── app.py             # Streamlit 前端（唯一入口）：输入区 + 三栏结果 + 固定合规声明
+├── orchestrator.py    # 验证编排：拆解 → 检索 → 分类 → 冲突检测 → 结论
+├── llm_client.py      # DeepSeek 调用：命题拆解 / 通用 JSON 调用 / 结论提示词与合规红线
+├── ifind_call.py      # iFinD MCP 客户端（内置）：token 走环境变量 / Secrets，本地与线上通用
+├── ifind_client.py    # iFinD 检索封装：search_notice / search_news
+├── config.py          # 统一配置读取：环境变量 / .env / Streamlit Secrets
+├── test_ifind.py      # 检索冒烟测试
+├── test_llm.py        # 命题拆解冒烟测试
+├── test.py            # 早期占位脚本
+├── requirements.txt   # 依赖：streamlit / requests / python-dotenv
+├── .streamlit/
+│   └── secrets.toml.example   # 线上 Secrets 模板（真身 secrets.toml 被忽略）
+├── .env               # 本地密钥（git 忽略）
+└── .gitignore
 ```
 
-## 快速开始
+**依赖清单**（`requirements.txt`）
 
-1. 安装依赖
+```
+streamlit>=1.29
+requests
+python-dotenv
+```
 
-   ```bash
-   pip install -r requirements.txt
-   ```
+> `streamlit>=1.29` 是硬要求：界面使用了 `st.container(border=True)`。`requests` 是 iFinD MCP 调用所需依赖。
 
-2. 启动应用
+---
 
-   ```bash
-   streamlit run app.py
-   ```
-
-3. 浏览器会自动打开（默认地址 http://localhost:8501）。
-
-## 使用方式
-
-1. 在「投资命题」输入框中填写你要验证的命题，例如：
-   > 新能源车渗透率提升将带动上游锂电材料公司利润持续增长。
-2. 点击 **开始验证**。
-3. 页面将展示：
-   - 3 个子问题；
-   - 每个子问题下 2 条证据（分别标注支持 / 反驳）；
-   - 最终结论：**部分支持**。
-
-## 说明
-
-- 结论与证据均为静态示例数据，尚未接入真实数据源或模型推理。
-- 后续可将 `app.py` 中的 `FAKE_SUB_QUESTIONS` 与 `FINAL_CONCLUSION` 替换为真实的验证流水线输出。
+**合规声明**：本产品仅用于投资研究辅助，不构成投资建议。

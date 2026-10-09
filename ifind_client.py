@@ -1,7 +1,11 @@
 """iFind 新闻 / 公告检索封装。
 
-对 iFinD skill 中 ``call.py`` 的 ``call(server_type, tool_name, params)`` 做一层薄封装，
-把三层嵌套的 MCP 响应拆解成扁平的「结果列表」，供 thesisproof 应用直接消费。
+对 ``call(server_type, tool_name, params)`` 做一层薄封装，把三层嵌套的 MCP 响应
+拆解成扁平的「结果列表」，供 thesisproof 应用直接消费。
+
+调用实现优先取**项目内置**的 ``ifind_call.py``（token 走环境变量 / Streamlit Secrets，
+不依赖本机 skill 路径，本地与线上同一份代码）；只有在缺少该模块时才回退到
+本机安装的 iFinD skill 目录。加载来源打印在每次调用的调试行里（``source=``）。
 
 实测的真实返回结构::
 
@@ -34,18 +38,7 @@ import json
 import sys
 import time
 
-# ---------------------------------------------------------------------------
-# 1) 把 iFinD skill 目录加入模块搜索路径，才能 import 到它的 call.py
-# ---------------------------------------------------------------------------
-IFIND_SKILL_PATH = "/Users/nikkiwithnicci/.workbuddy/skills/ifind-finance-data"
-if IFIND_SKILL_PATH not in sys.path:
-    sys.path.append(IFIND_SKILL_PATH)
-
-# 限流重试策略：iFinD 轻量级账号并发 2 也会触发 429，需要退避重试
-SEARCH_MAX_ATTEMPTS = 3  # 首次 + 最多 2 次重试
-RATE_LIMIT_BACKOFF_SECONDS = 3  # 退避基数：第 n 次重试等待 n * 基数 秒
-
-# call.py 内部用 verify=False 请求 https，屏蔽一下证书告警，避免刷屏
+# iFinD 接口用 verify=False 请求 https，屏蔽一下证书告警，避免刷屏
 try:
     import urllib3
 
@@ -53,14 +46,46 @@ try:
 except Exception:  # pragma: no cover - 缺 urllib3 不影响主流程
     pass
 
-# 延迟容错导入：即使 skill 不可用，本模块仍可被 import，调用时返回空列表
+# 仅在回退到本机 skill 时才需要这个路径；默认走内置实现，不依赖它
+IFIND_SKILL_PATH = "/Users/nikkiwithnicci/.workbuddy/skills/ifind-finance-data"
+
+# ---------------------------------------------------------------------------
+# 1) 加载 iFinD 调用实现
+#    内置 ifind_call（首选，可部署）→ 本机 skill（回退，仅本地可用）
+# ---------------------------------------------------------------------------
 try:
-    from call import call as _call
-except Exception as _import_exc:  # noqa: BLE001
-    _call = None
-    _IMPORT_ERROR = _import_exc
-else:
+    from ifind_call import call as _call
+
+    _CALL_SOURCE = "builtin"
     _IMPORT_ERROR = None
+except Exception as _builtin_exc:  # noqa: BLE001
+    try:
+        if IFIND_SKILL_PATH not in sys.path:
+            sys.path.append(IFIND_SKILL_PATH)
+        from call import call as _call  # type: ignore[no-redef]
+
+        _CALL_SOURCE = "skill"
+        _IMPORT_ERROR = None
+    except Exception as _skill_exc:  # noqa: BLE001
+        # 延迟容错：即使都不可用，本模块仍可被 import，调用时返回空列表
+        _call = None
+        _CALL_SOURCE = None
+        _IMPORT_ERROR = _skill_exc
+        _BUILTIN_ERROR = _builtin_exc
+else:
+    _BUILTIN_ERROR = None
+
+# 配置类错误（token 未配置）不重试 —— 这类问题重试无效，只会白等退避时间
+try:
+    from ifind_call import IFindConfigError as _ConfigError
+except Exception:  # noqa: BLE001 - 走 skill 回退时没有这个类
+
+    class _ConfigError(RuntimeError):  # type: ignore[no-redef]
+        """占位类型：skill 回退路径不会抛它，因此永远匹配不到。"""
+
+# 限流重试策略：iFinD 轻量级账号并发 2 也会触发 429，需要退避重试
+SEARCH_MAX_ATTEMPTS = 3  # 首次 + 最多 2 次重试
+RATE_LIMIT_BACKOFF_SECONDS = 3  # 退避基数：第 n 次重试等待 n * 基数 秒
 
 
 # ---------------------------------------------------------------------------
@@ -148,15 +173,22 @@ def _search(
 ) -> list:
     """公共实现：拼参数、调用、解析、打印调试信息、异常兜底。
 
-    限流（429）与网络异常都会退避重试；最终失败仍返回空列表（绝不向上抛异常），
-    但如果传入了 ``errors`` 列表，会把错误信息追加进去，
-    便于上层区分「没有结果」和「调用失败」。
+    限流（429）与网络异常都会退避重试；配置类错误（token 未配置）**不重试**，
+    直接失败（重试对配置问题无效，只会白等退避时间）。
+    最终失败仍返回空列表（绝不向上抛异常），但如果传入了 ``errors`` 列表，
+    会把错误信息追加进去，便于上层区分「没有结果」和「调用失败」。
     """
     tag = f"[ifind:{tool_name}]"
-    print(f"{tag} 请求参数 query={query!r} time_start={time_start} time_end={time_end} size={size}")
+    print(
+        f"{tag} 请求参数 query={query!r} time_start={time_start} time_end={time_end} "
+        f"size={size} source={_CALL_SOURCE}"
+    )
 
     if _call is None:
-        msg = f"{tag} 加载失败：无法导入 skill 的 call()：{_IMPORT_ERROR}"
+        msg = (
+            f"{tag} 加载失败：既无法导入内置 ifind_call（{_BUILTIN_ERROR}），"
+            f"也无法导入 skill 的 call()（{_IMPORT_ERROR}）"
+        )
         print(msg)
         if errors is not None:
             errors.append(msg)
@@ -177,6 +209,15 @@ def _search(
             items = _extract_items(resp)
         except Exception as exc:  # noqa: BLE001 - 对外统一降级为空列表
             last_err = exc
+
+            # 配置类错误（如 token 未配置）：重试无意义，直接失败
+            if isinstance(exc, _ConfigError):
+                msg = f"{tag} 配置错误，不重试：{exc}"
+                print(msg)
+                if errors is not None:
+                    errors.append(msg)
+                return []
+
             rate_limited = isinstance(exc, IFindError) and exc.rate_limited
             if attempt < max_attempts:
                 # 限流与网络抖动都是瞬时的，退避后重试

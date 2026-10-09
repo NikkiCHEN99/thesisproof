@@ -13,7 +13,14 @@
 - `llm_client.py` —— DeepSeek 调用 + **所有提示词集中在这里**：`PROMPT_TEMPLATE`（拆解）、
   `CONCLUSION_PROMPT` + `build_conclusion_prompt()`（结论）、`COMPLIANCE_RULES`（合规红线）、
   `detect_prediction_intent()`（预测类命题前置闸门）
-- `ifind_client.py` —— iFinD 检索封装，`search_notice` / `search_news`
+- `config.py` —— **统一配置读取**：`get_secret(name)` 依次查 环境变量 → `.env` → `st.secrets`。
+  **所有密钥读取都走这里**，不要直接 `os.environ[...]`。
+- `ifind_call.py` —— **项目内置的 iFinD MCP 客户端**（从 skill 的 `call.py` 移植）。
+  token 由 `get_auth_token()` 解析：`IFIND_MCP_KEY`（环境变量/`.env`/Secrets）→ 本地 `mcp_config.json`
+  （项目根目录 / `~/.workbuddy/skills/ifind-finance-data/`）。抛 `IFindConfigError` 表示配置类错误。
+- `ifind_client.py` —— iFinD 检索封装，`search_notice` / `search_news`。
+  调用实现优先取内置 `ifind_call`（`_CALL_SOURCE="builtin"`），仅在缺内置模块时回退本机 skill。
+- `.streamlit/secrets.toml.example` —— 线上 Secrets 模板（真身 `secrets.toml` 被忽略）
 - `test_ifind.py` / `test_llm.py` —— 检索 / 拆解冒烟测试
 - `test.py` —— 早期占位脚本
 
@@ -36,11 +43,16 @@
 - **短路兜底**（不调 LLM）：全部来源 failed → `insufficient`/`数据获取失败`；
   全部来源为空 → `insufficient`/`未检索到相关证据`；结论两次非法 JSON → `insufficient`/`结论生成失败`。
 - `errors` 只记**真问题**（failed、LLM 异常）；`missing` 只进 `retrieval_summary.messages`，不污染 errors。
+- **配置类错误不重试**：`ifind_call.IFindConfigError`（如 token 未配置）会被 `ifind_client._search`
+  直接判失败返回 `[]`。否则 12 个来源各白等 3+6s，累计近 1 分钟。
 
 ## 验证方式
 - Streamlit 改动优先用官方 `streamlit.testing.v1.AppTest` 做真机验证（会真实加载运行时，
   能抓出桩测试查不出的 API 用法错误），记得先 `at.text_input[0].set_value(...)` 再点按钮。
 - 隔离 venv 已装 `streamlit` / `requests` / `python-dotenv`。
+- **模拟 Streamlit Cloud**：把项目复制到临时目录、**删掉 `.env`**、写 `.streamlit/secrets.toml`
+  （`secrets.files` 含 `<cwd>/.streamlit/secrets.toml`），在该目录下运行即可复现线上布局。
+  注意脚本要 `sys.path.insert(0, os.getcwd())` 才能 import 到项目模块。
 
 ## 代码约定
 - 对外函数统一「失败降级」：`llm_client` 失败返回 `{}`，`ifind_client` 失败返回 `[]`，
@@ -52,8 +64,20 @@
 - 提示词**统一放 `llm_client.py`**，`orchestrator.py` 只保留数据流与 `CLASSIFY_PROMPT`；新增面向用户的提示词别散落到别处。
 - iFinD 并发上限 `Semaphore(2)`；但账号级限流（429）仍会触发，靠 `ifind_client` 的退避重试兜底。
 
+## 部署
+- **线上地址**：https://thesisproof-bxvn3ykgmlvafzyeenu2zz.streamlit.app/ （Streamlit Community Cloud，`curl` 返回 303 属正常跳转）
+- 该 URL 也记录在项目根目录 `Web_URL.txt`；README 第 2.2 节状态为「已上线」。
+- **线上要手工配 Secrets**（App settings → Secrets）：`DEEPSEEK_API_KEY`、`IFIND_MCP_KEY`。
+  `.env` 不会上传仓库。键名必须与代码一致。
+- iFinD 已改为**内置远程 MCP 调用**，不再依赖本机 skill 路径 —— 本地与线上同一份实现。
+  改完记得同步到 GitHub 仓库才会在线上生效（本目录不是 git 仓库）。
+
 ## 环境与密钥
 - 密钥放 `.env`（已被 `.gitignore` 忽略，内含**真实**密钥，切勿提交/外泄），键名：`DEEPSEEK_API_KEY`、`FUYAO_API_KEY`、`IFIND_MCP_KEY`。
-- `llm_client.py` 用 python-dotenv 加载：**显式指定路径** `load_dotenv(Path(__file__).resolve().parent / ".env")`，不用裸 `load_dotenv()`（裸调用在 `python -c`/交互式环境下会退回 CWD 查找而读不到）。
-- iFinD skill 路径：`/Users/nikkiwithnicci/.workbuddy/skills/ifind-finance-data`，其 `call.py` 依赖 `requests`。
+- **统一走 `config.get_secret()`**（环境变量 → `.env` → `st.secrets`）；`config.py` 里用
+  **显式路径** `load_dotenv(ROOT / ".env")`，不用裸 `load_dotenv()`（裸调用在 `python -c`/交互式环境下会退回 CWD 查找而读不到）。
+- Streamlit 会把**顶层**字符串 secret 写入 `os.environ`（见 `streamlit/runtime/secrets.py`），
+  `st.secrets` 兜底是为了不依赖这个加载时序。
+- `IFIND_MCP_KEY` = `~/.workbuddy/skills/ifind-finance-data/mcp_config.json` 里的 `auth_token`（930 字符 JWT），已实测同值。
+- iFinD skill 路径：`/Users/nikkiwithnicci/.workbuddy/skills/ifind-finance-data`（**仅作回退**），其 `call.py` 依赖 `requests`。
 - `requirements.txt`：`streamlit>=1.29`（`st.container(border=True)` 需要）、`requests`、`python-dotenv`。

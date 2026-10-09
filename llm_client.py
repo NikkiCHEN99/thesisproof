@@ -7,24 +7,18 @@
 - ``COMPLIANCE_RULES``  合规红线：禁止价格方向/操作用语、禁止承诺收益、
   涉及预测涨跌一律拒绝并回复「仅做事实梳理」
 
-API Key 通过 python-dotenv 从项目根目录的 ``.env`` 读取（环境变量 ``DEEPSEEK_API_KEY``）。
+API Key 由 ``config.get_secret("DEEPSEEK_API_KEY")`` 读取，
+依次尝试：环境变量 / ``.env``（本地）/ Streamlit Secrets（线上）。
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
-from pathlib import Path
 
-from dotenv import load_dotenv
+from config import get_secret
 
 import requests
-
-# 显式指定与本文件同级的 .env：
-# load_dotenv() 不带参数时，在交互式/`python -c` 环境下会退回「当前工作目录」查找，
-# 从别处启动进程就会读不到 Key。这里固定按文件位置解析，避免踩这个坑。
-load_dotenv(Path(__file__).resolve().parent / ".env")
 
 API_URL = "https://api.deepseek.com/chat/completions"
 MODEL = "deepseek-chat"
@@ -202,9 +196,11 @@ def _extract_json(text: str) -> dict:
 
 def _chat(prompt: str, system: str = None) -> str:
     """调一次 DeepSeek chat，返回 message.content 文本。"""
-    api_key = os.getenv("DEEPSEEK_API_KEY")
+    api_key = get_secret("DEEPSEEK_API_KEY")
     if not api_key:
-        raise ValueError("未找到 DEEPSEEK_API_KEY，请检查 .env 文件")
+        raise ValueError(
+            "未找到 DEEPSEEK_API_KEY，请检查 .env 文件（本地）或 Streamlit Secrets（线上）"
+        )
 
     payload = {
         "model": MODEL,
