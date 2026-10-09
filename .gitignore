@@ -21,3 +21,6 @@ mcp_config.json
 .idea/
 .vscode/
 .DS_Store
+
+# AI 协作工作记忆（不属于提交物）
+.workbuddy/
