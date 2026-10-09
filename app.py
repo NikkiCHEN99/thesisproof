@@ -3,9 +3,13 @@
 输入投资命题 -> 点击「开始验证」 -> 调用 orchestrator.verify_thesis 走完整验证链路，
 然后以三栏布局呈现：子问题 / 证据 / 冲突与结论。
 
-结论与冲突卡之后提供「继续追问」：把 {命题、子问题、证据卡、结论} 作为上下文，
-连同用户的新问题交给 ``llm_client.ask_followup`` 回答，用聊天气泡展示，
-历史存在 ``st.session_state``，回答里的 [E1] 编号可回查到具体证据卡。
+结果区提供两个动作：
+- 「保存为研究任务」：把当前结果落盘到 ``./saved_tasks/``（storage.py）
+- 「继续追问」：把 {命题、子问题、证据卡、结论} 作为上下文，
+  连同用户的新问题交给 ``llm_client.ask_followup`` 回答，
+  历史存在 ``st.session_state``，回答里的 [E1] 编号可回查到具体证据卡。
+
+左侧边栏列出已保存的研究任务，可选中并重新加载到页面。
 """
 
 from datetime import date, timedelta
@@ -14,6 +18,7 @@ import streamlit as st
 
 from llm_client import ask_followup
 from orchestrator import build_result_context, verify_thesis
+from storage import list_tasks, load_task, save_task
 
 st.set_page_config(
     page_title="投资命题验证台",
@@ -168,6 +173,93 @@ if st.button("开始验证", type="primary"):
 
 result = st.session_state.get("result")
 
+
+# ---------------------------------------------------------------------------
+# 交互回调：Streamlit 约定 —— 写盘 / 换结果这类「先改状态再重绘」的动作放回调里，
+# 回调在脚本重跑前执行，因此侧边栏能当轮看到新保存的任务。
+# 不要用 st.button + st.rerun()：1.30 下按钮的触发态会在显式 rerun 后残留，导致无限重跑。
+# ---------------------------------------------------------------------------
+def _save_current_result() -> None:
+    """「保存为研究任务」回调：把当前结果写入 ./saved_tasks/。"""
+    current = st.session_state.get("result") or {}
+    thesis_text = st.session_state.get("result_thesis") or current.get("thesis") or ""
+    try:
+        filename = save_task(thesis_text, current)
+    except Exception as exc:  # noqa: BLE001 - 磁盘异常只提示，不让页面崩掉
+        st.session_state["flash_error"] = f"保存失败：{type(exc).__name__}: {exc}"
+    else:
+        st.session_state["flash"] = f"保存成功：{filename}"
+        print(f"[app] 保存研究任务 {filename}")
+
+
+def _load_selected_task() -> None:
+    """侧边栏「加载」回调：把选中任务重新载入页面。"""
+    tasks = list_tasks()
+    idx = st.session_state.get("task_pick")
+
+    if not isinstance(idx, int) or not (0 <= idx < len(tasks)):
+        st.session_state["flash_error"] = "所选任务已失效（可能已被删除），请重新选择。"
+        return
+
+    try:
+        record = load_task(tasks[idx]["filename"])
+    except Exception as exc:  # noqa: BLE001 - 文件丢失 / 损坏时给出提示
+        st.session_state["flash_error"] = f"加载失败：{type(exc).__name__}: {exc}"
+        return
+
+    st.session_state["result"] = record["result"]
+    st.session_state["result_thesis"] = record["thesis"]
+    # 换了一条命题：追问历史与上下文都作废，避免串台
+    st.session_state["followups"] = []
+    st.session_state["followup_context"] = build_result_context(record["result"])
+    st.session_state["flash"] = f"已加载研究任务：{record['filename']}"
+
+
+def _clear_followups() -> None:
+    """「清空追问记录」回调。"""
+    st.session_state["followups"] = []
+
+
+# ---------------------------------------------------------------------------
+# 侧边栏：我的研究任务（storage.list_tasks / load_task）
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.header("📂 我的研究任务")
+
+    try:
+        saved_tasks = list_tasks()
+    except Exception as exc:  # noqa: BLE001 - 侧边栏不能因为磁盘问题拖垮页面
+        saved_tasks = []
+        st.error(f"读取任务列表失败：{type(exc).__name__}: {exc}")
+
+    if not saved_tasks:
+        st.caption("还没有保存的任务。验证一条命题后，点结果区下方的「💾 保存为研究任务」。")
+    else:
+        labels = [
+            f"{(t['thesis'] or '（无命题）')[:20]} ｜ {t['saved_at'] or '—'}"
+            for t in saved_tasks
+        ]
+        st.selectbox(
+            "选择任务",
+            options=list(range(len(saved_tasks))),
+            format_func=lambda i: labels[i],
+            key="task_pick",
+        )
+        col_load, col_meta = st.columns([1, 1])
+        with col_load:
+            st.button("加载", type="primary", on_click=_load_selected_task)
+        with col_meta:
+            st.caption(f"共 {len(saved_tasks)} 个")
+        st.caption("任务文件存放在 `./saved_tasks/`（云端实例重启后会丢失）。")
+
+# 提示条：保存成功 / 加载结果（回调写入，这里消费掉）
+_flash = st.session_state.pop("flash", None)
+if _flash:
+    st.success(_flash)
+_flash_error = st.session_state.pop("flash_error", None)
+if _flash_error:
+    st.error(_flash_error)
+
 if result:
     st.divider()
     st.markdown(
@@ -259,7 +351,15 @@ if result:
                 for cond in conditions:
                     st.markdown(f"- {cond}")
 
-    # ---------------- 结论卡 / 冲突卡之后：继续追问 ----------------
+    # ---------------- 结论卡 / 冲突卡之后：保存为研究任务 ----------------
+    st.divider()
+    col_save, col_note = st.columns([1, 3], gap="medium")
+    with col_save:
+        st.button("💾 保存为研究任务", on_click=_save_current_result)
+    with col_note:
+        st.caption("保存后在左侧「📂 我的研究任务」中可随时重新加载。")
+
+    # ---------------- 继续追问 ----------------
     st.divider()
     st.subheader("继续追问")
     st.caption(
@@ -360,9 +460,7 @@ if result:
         )
 
     if st.session_state["followups"]:
-        if st.button("清空追问记录"):
-            st.session_state["followups"] = []
-            st.rerun()
+        st.button("清空追问记录", on_click=_clear_followups)
 
     # 追问输入框是固定在视口底部的浮动容器（不同 Streamlit 版本高度不同），
     # 给页面底部留出足够空间，保证滚动到最底时内联合规声明不会被输入框盖住
