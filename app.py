@@ -3,13 +3,17 @@
 输入投资命题 -> 点击「开始验证」 -> 调用 orchestrator.verify_thesis 走完整验证链路，
 然后以三栏布局呈现：子问题 / 证据 / 冲突与结论。
 
-结果区提供两个动作：
+结果区提供三个动作：
 - 「保存为研究任务」：把当前结果落盘到 ``./saved_tasks/``（storage.py）
 - 「继续追问」：把 {命题、子问题、证据卡、结论} 作为上下文，
   连同用户的新问题交给 ``llm_client.ask_followup`` 回答，
   历史存在 ``st.session_state``，回答里的 [E1] 编号可回查到具体证据卡。
+- 「以此为基础比较」：把当前结果临时放进 ``st.session_state`` 的对比面板 A 侧。
 
 左侧边栏列出已保存的研究任务，可选中并重新加载到页面。
+
+页面顶部的「📊 命题对比」面板（Expander）可从已保存任务中挑两条并排对比：
+命题、结论、冲突数量、支持/反对/无法验证证据数量，全部用 ``st.metric`` 呈现。
 """
 
 from datetime import date, timedelta
@@ -139,6 +143,264 @@ def render_evidence_card(ev: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 会话状态：追问历史 / 上下文 + 对比面板 A、B 两侧，跨 rerun 保留
+# ---------------------------------------------------------------------------
+st.session_state.setdefault("followups", [])  # [{"role", "text", "citations", "refused", "insufficient"}]
+st.session_state.setdefault("followup_context", "")  # 本次验证结果压成的追问上下文
+st.session_state.setdefault("compare_a", None)  # {"thesis", "source", "result"}
+st.session_state.setdefault("compare_b", None)
+
+
+# ---------------------------------------------------------------------------
+# 命题对比：把一次验证结果抽成可比较的结构化指标
+# ---------------------------------------------------------------------------
+VERDICT_COLOR = {"support": "green", "partial_support": "orange", "oppose": "red"}
+COMPARE_EMPTY_LABEL = "— 未选择 —"
+
+
+def result_stats(result: dict) -> dict:
+    """抽出用于并排对比的指标：结论、冲突数、三类证据数、子问题数。"""
+    result = result if isinstance(result, dict) else {}
+    evidence = [ev for ev in (result.get("evidence") or []) if isinstance(ev, dict)]
+
+    counts = {"support": 0, "oppose": 0, "unverifiable": 0}
+    for ev in evidence:
+        status = ev.get("status")
+        counts[status if status in counts else "unverifiable"] += 1
+
+    verdict = result.get("verdict") if isinstance(result.get("verdict"), dict) else {}
+    v_key = verdict.get("verdict") or "insufficient"
+    return {
+        "verdict": v_key,
+        "verdict_label": VERDICT_LABEL.get(v_key, v_key),
+        "summary": verdict.get("summary") or "—",
+        "conflicts": len(result.get("conflicts") or []),
+        "sub_questions": len(result.get("sub_questions") or []),
+        "evidence_total": len(evidence),
+        "support": counts["support"],
+        "oppose": counts["oppose"],
+        "unverifiable": counts["unverifiable"],
+        "subject": result.get("subject") or "未识别",
+        "time_range": result.get("time_range") or "未指定",
+    }
+
+
+def _slot_from_record(record: dict, source: str) -> dict:
+    """把 storage.load_task 的返回包装成对比面板的一侧。"""
+    return {
+        "thesis": record.get("thesis") or "",
+        "source": source,
+        "result": record.get("result") or {},
+    }
+
+
+def task_option_labels(tasks: list) -> list:
+    """任务下拉框的选项标签：首项为「未选择」，其余为「命题 ｜ 保存时间」。
+
+    直接以标签字符串作为选项值（不用 ``format_func``）：Streamlit 的
+    ``format_func`` + 非字符串 options 组合在回读选中值时会错位，
+    同一份标签同时用于「选中值 → 任务」的反查。
+    """
+    labels = [COMPARE_EMPTY_LABEL]
+    seen: dict = {}
+    for task in tasks:
+        base = f"{(task.get('thesis') or '（无命题）')[:20]} ｜ {task.get('saved_at') or '—'}"
+        seen[base] = seen.get(base, 0) + 1
+        labels.append(base if seen[base] == 1 else f"{base}（{seen[base]}）")
+    return labels
+
+
+def _resolve_task_index(labels: list, picked) -> int:
+    """把下拉框选中值解析成 tasks 下标；「未选择」或无效值返回 -1。"""
+    if not isinstance(picked, str) or picked not in labels:
+        return -1
+    return labels.index(picked) - 1
+
+
+def _apply_compare_pick(side: str) -> None:
+    """下拉框变化回调：把选中的已保存任务读进 A / B 侧（选「未选择」则清空该侧）。"""
+    tasks = list_tasks()
+    idx = _resolve_task_index(task_option_labels(tasks), st.session_state.get(f"compare_pick_{side}"))
+    slot_key = f"compare_{side}"
+
+    if idx < 0:
+        st.session_state[slot_key] = None
+        return
+
+    meta = tasks[idx]
+    try:
+        record = load_task(meta["filename"])
+    except Exception as exc:  # noqa: BLE001 - 文件缺失 / 损坏只提示，不让页面崩掉
+        st.session_state[slot_key] = None
+        st.session_state["flash_error"] = f"读取对比任务失败：{type(exc).__name__}: {exc}"
+        return
+
+    st.session_state[slot_key] = _slot_from_record(
+        record, source=meta.get("saved_at") or meta["filename"]
+    )
+
+
+def _pick_compare_a() -> None:
+    _apply_compare_pick("a")
+
+
+def _pick_compare_b() -> None:
+    _apply_compare_pick("b")
+
+
+def _use_current_as_compare() -> None:
+    """「以此为基础比较」回调：把当前验证结果临时放到对比面板 A 侧。"""
+    current = st.session_state.get("result")
+    if not isinstance(current, dict) or not current:
+        st.session_state["flash_error"] = "还没有验证结果，先验证一条命题再试。"
+        return
+
+    st.session_state["compare_a"] = {
+        "thesis": st.session_state.get("result_thesis") or current.get("thesis") or "",
+        "source": "当前验证结果",
+        "result": current,
+    }
+    # A 侧来自「当前结果」时不指向任何已保存任务，把下拉框同步回空
+    st.session_state["compare_pick_a"] = COMPARE_EMPTY_LABEL
+    st.session_state["flash"] = "已把当前结果放到顶部「命题对比」的 A 侧，再选一个任务作为 B 侧即可并排对比。"
+
+
+def _clear_compare_a() -> None:
+    st.session_state["compare_a"] = None
+    st.session_state["compare_pick_a"] = COMPARE_EMPTY_LABEL
+
+
+def _clear_compare_b() -> None:
+    st.session_state["compare_b"] = None
+    st.session_state["compare_pick_b"] = COMPARE_EMPTY_LABEL
+
+
+def render_compare_panel(slot_a: dict, slot_b: dict) -> None:
+    """A / B 并排对比：命题、结论、冲突数量、三类证据数量（st.metric + Δ）。"""
+    sa = result_stats(slot_a.get("result"))
+    sb = result_stats(slot_b.get("result"))
+
+    if sa["verdict"] != sb["verdict"]:
+        st.warning(
+            f"结论不一致：A = {sa['verdict_label']}，B = {sb['verdict_label']}"
+            f"（冲突 {sa['conflicts']} vs {sb['conflicts']}）"
+        )
+    else:
+        st.success(f"结论一致：两侧均为「{sa['verdict_label']}」")
+
+    left, right = st.columns(2, gap="medium")
+
+    def _side(col, slot: dict, stat: dict, other: dict, name: str) -> None:
+        with col:
+            st.markdown(f"#### 任务 {name}")
+            st.markdown(f"**命题**：{slot.get('thesis') or '（无命题）'}")
+            st.caption(
+                f"来源：{slot.get('source') or '—'}　｜　主体：{stat['subject']}"
+                f"　｜　时间范围：{stat['time_range']}"
+            )
+            st.markdown(
+                f"**结论**：:{VERDICT_COLOR.get(stat['verdict'], 'gray')}"
+                f"[{stat['verdict_label']}]"
+            )
+            st.caption((stat["summary"] or "—")[:200])
+
+            row1 = st.columns(2)
+            row1[0].metric(
+                "冲突数量", stat["conflicts"],
+                delta=stat["conflicts"] - other["conflicts"], delta_color="off",
+            )
+            row1[1].metric(
+                "子问题", stat["sub_questions"],
+                delta=stat["sub_questions"] - other["sub_questions"], delta_color="off",
+            )
+
+            row2 = st.columns(3)
+            row2[0].metric(
+                "支持", stat["support"],
+                delta=stat["support"] - other["support"], delta_color="off",
+            )
+            row2[1].metric(
+                "反对", stat["oppose"],
+                delta=stat["oppose"] - other["oppose"], delta_color="off",
+            )
+            row2[2].metric(
+                "无法验证", stat["unverifiable"],
+                delta=stat["unverifiable"] - other["unverifiable"], delta_color="off",
+            )
+            st.caption(
+                f"证据总数 {stat['evidence_total']}"
+                f"（Δ {stat['evidence_total'] - other['evidence_total']:+d}）"
+            )
+
+    _side(left, slot_a, sa, sb, "A")
+    _side(right, slot_b, sb, sa, "B")
+    st.caption("Δ 为该指标相对另一侧的差值，只表示数量多寡，不含优劣判断。")
+
+
+# 已保存任务列表：侧边栏与对比面板共用（只读一次，避免重复扫描目录）
+try:
+    saved_tasks = list_tasks()
+except Exception as exc:  # noqa: BLE001 - 磁盘异常不应拖垮页面
+    saved_tasks = []
+    _saved_tasks_error = f"读取任务列表失败：{type(exc).__name__}: {exc}"
+else:
+    _saved_tasks_error = ""
+
+# ---------------------------------------------------------------------------
+# 页面顶部：命题对比（Expander）
+# ---------------------------------------------------------------------------
+with st.expander(
+    "📊 命题对比",
+    expanded=bool(st.session_state.get("compare_a") or st.session_state.get("compare_b")),
+):
+    st.caption(
+        "从已保存的研究任务里各选一条并排对比；也可以先在下方验证一条命题，"
+        "再点结果区的「🔀 以此为基础比较」把当前结果放到 A 侧，然后挑 B 侧。"
+    )
+
+    if not saved_tasks:
+        st.caption("还没有已保存的任务。先在下方验证一条命题，再点「💾 保存为研究任务」。")
+    else:
+        options = task_option_labels(saved_tasks)
+        pick_a, pick_b = st.columns(2, gap="medium")
+        with pick_a:
+            st.selectbox(
+                "对比 A（左栏）", options=options, key="compare_pick_a", on_change=_pick_compare_a
+            )
+        with pick_b:
+            st.selectbox(
+                "对比 B（右栏）", options=options, key="compare_pick_b", on_change=_pick_compare_b
+            )
+
+    slot_a = st.session_state.get("compare_a")
+    slot_b = st.session_state.get("compare_b")
+
+    if slot_a or slot_b:
+        chip_a, chip_b = st.columns(2, gap="medium")
+        for col, slot, name, clearer in (
+            (chip_a, slot_a, "A", _clear_compare_a),
+            (chip_b, slot_b, "B", _clear_compare_b),
+        ):
+            with col:
+                if slot:
+                    st.markdown(f"`{name}` **{(slot.get('thesis') or '（无命题）')[:28]}**")
+                    st.caption(f"来源：{slot.get('source') or '—'}")
+                    st.button(f"移除 {name} 侧", key=f"compare_clear_{name}", on_click=clearer)
+                else:
+                    st.caption(f"{name} 侧待选择")
+
+    if slot_a and slot_b:
+        st.divider()
+        if (slot_a.get("thesis") or "") == (slot_b.get("thesis") or "") and (
+            slot_a.get("source") or ""
+        ) == (slot_b.get("source") or ""):
+            st.info("两侧选的是同一条任务，各项指标应完全一致。")
+        render_compare_panel(slot_a, slot_b)
+    elif slot_a or slot_b:
+        st.info("已选好一侧，再选另一侧即可并排对比。")
+
+
+# ---------------------------------------------------------------------------
 # 输入区
 # ---------------------------------------------------------------------------
 thesis = st.text_input("投资命题", placeholder="请输入投资命题")
@@ -148,12 +410,6 @@ with col_start:
     time_start = st.date_input("开始日期", value=date.today() - timedelta(days=730))
 with col_end:
     time_end = st.date_input("结束日期", value=date.today())
-
-# ---------------------------------------------------------------------------
-# 追问相关的会话状态：历史与上下文，跨 rerun 保留
-# ---------------------------------------------------------------------------
-st.session_state.setdefault("followups", [])  # [{"role": "user"/"assistant", "text", "citations", "refused", "insufficient"}]
-st.session_state.setdefault("followup_context", "")  # 本次验证结果压成的追问上下文
 
 if st.button("开始验证", type="primary"):
     query = thesis.strip()
@@ -195,9 +451,9 @@ def _save_current_result() -> None:
 def _load_selected_task() -> None:
     """侧边栏「加载」回调：把选中任务重新载入页面。"""
     tasks = list_tasks()
-    idx = st.session_state.get("task_pick")
+    idx = _resolve_task_index(task_option_labels(tasks), st.session_state.get("task_pick"))
 
-    if not isinstance(idx, int) or not (0 <= idx < len(tasks)):
+    if idx < 0 or idx >= len(tasks):
         st.session_state["flash_error"] = "所选任务已失效（可能已被删除），请重新选择。"
         return
 
@@ -226,23 +482,15 @@ def _clear_followups() -> None:
 with st.sidebar:
     st.header("📂 我的研究任务")
 
-    try:
-        saved_tasks = list_tasks()
-    except Exception as exc:  # noqa: BLE001 - 侧边栏不能因为磁盘问题拖垮页面
-        saved_tasks = []
-        st.error(f"读取任务列表失败：{type(exc).__name__}: {exc}")
+    if _saved_tasks_error:
+        st.error(_saved_tasks_error)
 
     if not saved_tasks:
         st.caption("还没有保存的任务。验证一条命题后，点结果区下方的「💾 保存为研究任务」。")
     else:
-        labels = [
-            f"{(t['thesis'] or '（无命题）')[:20]} ｜ {t['saved_at'] or '—'}"
-            for t in saved_tasks
-        ]
         st.selectbox(
             "选择任务",
-            options=list(range(len(saved_tasks))),
-            format_func=lambda i: labels[i],
+            options=task_option_labels(saved_tasks),
             key="task_pick",
         )
         col_load, col_meta = st.columns([1, 1])
@@ -351,13 +599,19 @@ if result:
                 for cond in conditions:
                     st.markdown(f"- {cond}")
 
-    # ---------------- 结论卡 / 冲突卡之后：保存为研究任务 ----------------
+    # ---------------- 结论卡 / 冲突卡之后：保存为研究任务 / 以此为基础比较 ----------------
     st.divider()
-    col_save, col_note = st.columns([1, 3], gap="medium")
+    col_save, col_compare, col_note = st.columns([1, 1.1, 2.6], gap="medium")
     with col_save:
         st.button("💾 保存为研究任务", on_click=_save_current_result)
+    with col_compare:
+        st.button("🔀 以此为基础比较", on_click=_use_current_as_compare)
     with col_note:
-        st.caption("保存后在左侧「📂 我的研究任务」中可随时重新加载。")
+        st.caption(
+            "保存后在左侧「📂 我的研究任务」中可随时重新加载；"
+            "点「以此为基础比较」会把当前结果放到顶部「📊 命题对比」的 A 侧，"
+            "再从下拉框挑另一条任务作为 B 侧并排对比。"
+        )
 
     # ---------------- 继续追问 ----------------
     st.divider()
